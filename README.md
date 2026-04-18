@@ -2,7 +2,7 @@
 
 This repository contains a collection of utility scripts for working with firmware and binaries associated with Realtek RTL930x-based network switches. 
 
-## Scripts
+## Generic Scripts
 
 ### `extract_kernel.py`
 
@@ -18,3 +18,11 @@ exact partition layout from a serial console.
 
 Attempts to extract the hardware profiles from the `rtcore.ko` kernel module. This can be useful for determining the
 proper values for a device tree.
+
+## `imi` Firmware
+
+Quite a few devices using RTL930x chips from China seem to be using the `imi`-firmware, i.e. the main app binary is called `imi`.
+Such devices can usually be spotted by the extraction of `/mnt/switch.tar.gz` on their serial console at boot, or by the fact
+the web interface expects a `switch.tar.gz` file for firmware updates.
+
+The `imi-firmware` folder has further scripts specific to that firmware.

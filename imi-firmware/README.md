@@ -1,0 +1,12 @@
+# imi-firmware
+
+On devices with a serial console, U-Boot is usually protected with a custom key combindation: `Ctrl+C`, `z` , `h` have to be
+pressed in sequence when the countdown appears.
+
+The scripts acting over serial assume that this unlock sequence has to be used. If you're working with a device that
+does not have this, you likely need to adapt the scripts slightly.
+
+## `get_chip_type.py`
+
+Connects over serial, unlocks U-Boot and then reads the chip identification register to determine the exact chip
+revision used.
