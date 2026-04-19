@@ -8,7 +8,7 @@ import time
 import tempfile
 
 # U-Boot style header definitions
-IH_MAGIC = 0x93000000
+SUPPORTED_MAGICS = [0x93000000, 0x83800000]
 IH_NMLEN = 32
 
 OS_MAP = {5: "Linux"}
@@ -54,6 +54,22 @@ def parse_header(data):
         'ih_name':  fields[11].split(b'\0')[0].decode('ascii', 'ignore')
     }
     return h
+
+def validate_header(data, pos):
+    if pos + 64 > len(data):
+        return None
+    
+    magic = struct.unpack('>I', data[pos:pos+4])[0]
+    if magic in SUPPORTED_MAGICS:
+        # Check if name field (32 bytes at offset 0x20) is a valid ASCII string
+        name_field = data[pos+0x20:pos+0x40]
+        name_end = name_field.find(b'\0')
+        name_to_check = name_field[:name_end] if name_end != -1 else name_field
+        
+        # Ensure it only contains printable ASCII characters
+        if all(32 <= c <= 126 for c in name_to_check):
+            return parse_header(data[pos:])
+    return None
 
 def extract_kernel(firmware_data, header, header_pos, output_path):
     print(f"[*] Extracting kernel to {output_path}...")
@@ -148,17 +164,25 @@ def main():
     # Scan for Realtek Header
     print(f"[*] Scanning {image_path} for Realtek SDK headers...")
     found_pos = -1
-    start_search = 0
-    while True:
-        pos = data.find(b'\x93\x00\x00\x00', start_search)
-        if pos == -1: break
-        
-        # Check for RTK_SDK name at pos + 0x20
-        if data[pos+0x20:pos+0x27] == b'RTK_SDK':
+    header = None
+    
+    # Try 4KiB aligned positions first
+    for pos in range(0, len(data), 4096):
+        header = validate_header(data, pos)
+        if header:
             found_pos = pos
-            print(f"[+] Found header at 0x{pos:X}")
+            print(f"[+] Found header with magic 0x{header['ih_magic']:08X} at 4KiB aligned offset 0x{pos:X}")
             break
-        start_search = pos + 1
+
+    # Fallback to byte-by-byte scan
+    if found_pos == -1:
+        print("[*] No header found at 4KiB aligned offsets, falling back to full scan...")
+        for pos in range(len(data) - 64):
+            header = validate_header(data, pos)
+            if header:
+                found_pos = pos
+                print(f"[+] Found header with magic 0x{header['ih_magic']:08X} at offset 0x{pos:X}")
+                break
 
     if found_pos == -1:
         print("[-] Could not find a valid Realtek SDK header.")
