@@ -33,7 +33,7 @@ import re
 import json
 from typing import Optional, List, Dict, Any
 from collections import deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import typer
 import serial
@@ -122,13 +122,30 @@ def trigger_reboot() -> Result:
 
 
 @method
-def send_data(data: str) -> Result:
-    """Sends raw string data to the serial port."""
+def send_data(data: str, wait_for_text: Optional[str] = None, wait_timeout: float = 30.0) -> Result:
+    """Sends raw string data to the serial port and optionally waits for a response string."""
     if state.serial_port and state.serial_port.is_open:
         with state.lock:
+            initial_line_counter = state.line_counter
             state.serial_port.write(data.encode('utf-8'))
-        return Success(f"Sent {len(data)} bytes")
-    return Success("Serial port not open", False)
+        
+        if wait_for_text:
+            start_time = time.time()
+            last_checked = initial_line_counter
+            console.log(f"[bold blue]Waiting for '{wait_for_text}' (timeout={wait_timeout}s)...")
+            while time.time() - start_time < wait_timeout:
+                with state.lock:
+                    # Check lines from last_checked to current
+                    for count, text in state.lines:
+                        if count > last_checked:
+                            if wait_for_text in text:
+                                return Success(f"Found '{wait_for_text}' in line {count}")
+                    last_checked = state.line_counter
+                time.sleep(0.05)
+            return Success({"message": f"Timeout waiting for '{wait_for_text}' after {wait_timeout}s", "success": False})
+
+        return Success({"message": f"Sent {len(data)} bytes", "success": True})
+    return Success({"message": "Serial port not open", "success": False})
 
 
 @method
@@ -256,7 +273,7 @@ def manager(
     reader_thread.start()
 
     # Start RPC Server (Main Thread)
-    server = HTTPServer(("localhost", rpc_port), RPCRequestHandler)
+    server = ThreadingHTTPServer(("localhost", rpc_port), RPCRequestHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -298,13 +315,21 @@ def reboot():
 
 
 @app.command()
-def send(data: str):
+def send(
+    data: str,
+    wait_for_text: Optional[str] = typer.Option(
+        None, "--wait-for-text", "-w", help="Wait for this text in output before returning"
+    ),
+    wait_timeout: float = typer.Option(
+        30.0, "--wait-timeout", "-t", help="Maximum time to wait for the text (seconds)"
+    )
+):
     """
     Send a string to the device's serial port (e.g., 'ls\\n').
     """
     # Decode escape sequences like \n, \r, \x1b
     decoded_data = data.encode('utf-8').decode('unicode_escape')
-    result = call_rpc("send_data", data=decoded_data)
+    result = call_rpc("send_data", data=decoded_data, wait_for_text=wait_for_text, wait_timeout=wait_timeout)
     console.print(f"[bold green]{result}")
 
 
