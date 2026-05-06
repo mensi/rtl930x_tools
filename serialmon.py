@@ -28,7 +28,7 @@ app = typer.Typer(help="Serial port monitor and manager")
 # --- Constants and Configuration ---
 DEFAULT_BAUD = 115200
 DEFAULT_BUFFER_SIZE = 10000
-SOCKET_TIMEOUT = 10.0
+SOCKET_TIMEOUT = 60.0
 
 # --- TLV Protocol Helpers ---
 # Type: 1 byte, Length: 4 bytes (I), Value: length bytes
@@ -77,20 +77,55 @@ class LineBuffer:
         self.counter = 0
         self.lock = threading.Lock()
         self.current_line = ""
+        self.last_char = ""
 
     def append_char(self, char: str):
         with self.lock:
             if char == '\n':
-                self.counter += 1
-                line = self.current_line
-                if line.endswith('\r'):
-                    line = line[:-1]
-                self.buffer.append((self.counter, line))
-                self.current_line = ""
-                if len(self.buffer) > self.max_lines:
-                    self.buffer.pop(0)
+                if self.last_char == '\r':
+                    # Already handled the line break on \r
+                    pass
+                else:
+                    self._commit_line()
+            elif char == '\r':
+                self._commit_line()
             else:
                 self.current_line += char
+            self.last_char = char
+
+    def _commit_line(self):
+        # This is called with self.lock held by append_char
+        self.counter += 1
+        self.buffer.append((self.counter, self.current_line))
+        self.current_line = ""
+        if len(self.buffer) > self.max_lines:
+            self.buffer.pop(0)
+
+    def get_pos(self) -> Tuple[int, int]:
+        with self.lock:
+            return self.counter, len(self.current_line)
+
+    def get_data_after(self, start_counter: int, start_pos: int) -> str:
+        with self.lock:
+            parts = []
+            found_any = False
+            for num, line in self.buffer:
+                if num > start_counter:
+                    if num == start_counter + 1:
+                        parts.append(line[start_pos:])
+                    else:
+                        parts.append(line)
+                    found_any = True
+            
+            if start_counter == self.counter:
+                parts.append(self.current_line[start_pos:])
+            else:
+                # If we've already added lines from the buffer, we add the full current_line.
+                # If we haven't found any lines > start_counter but start_counter is NOT self.counter,
+                # it means start_counter is older than the buffer, so we take the full current_line too.
+                parts.append(self.current_line)
+            
+            return "\n".join(parts)
 
     def get_lines(self, start: int, end: Optional[int] = None) -> List[Tuple[int, str]]:
         with self.lock:
@@ -113,16 +148,6 @@ class LineBuffer:
         with self.lock:
             return [(num, line) for num, line in self.buffer if prog.search(line)]
 
-    def contains(self, text: str) -> bool:
-        with self.lock:
-            # Check last few lines and current line
-            for _, line in reversed(self.buffer[-5:]):
-                if text in line:
-                    return True
-            if text in self.current_line:
-                return True
-        return False
-
 class SerialManager:
     def __init__(self, port: str, baud: int, buffer_size: int):
         self.port = port
@@ -133,6 +158,7 @@ class SerialManager:
         except serial.SerialException as e:
             print(f"Could not open serial port {port}: {e}")
             sys.exit(1)
+        self.ser_lock = threading.Lock()
         self.reset_method = "none"
         self.reset_params = {}
         self.interrupt_method = "none"
@@ -172,24 +198,35 @@ class SerialManager:
     def handle_interrupt(self):
         if self.interrupt_method == "uboot":
             print("Waiting for U-Boot interrupt prompt...")
-            self.wait_and_send("Hit Esc key to stop autoboot", "\x1b\x1b\x1b\r")
-            self.wait_and_send("# ", "", timeout=5.0)
+            pos = self.line_buffer.get_pos()
+            # Send single Esc first to be less aggressive
+            if self.wait_and_send("Hit Esc key to stop autoboot", "\x1b", start_pos=pos):
+                pos2 = self.line_buffer.get_pos()
+                self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
         elif self.interrupt_method == "imi":
             print("Waiting for IMI interrupt prompt...")
-            self.wait_and_send("No ethernet found.", "\x03zh")
-            self.wait_and_send("# ", "", timeout=5.0)
+            pos = self.line_buffer.get_pos()
+            if self.wait_and_send("No ethernet found.", "\x03zh", start_pos=pos):
+                pos2 = self.line_buffer.get_pos()
+                self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
 
-    def wait_and_send(self, prompt: str, keys: str, timeout: float = 30.0):
+    def wait_and_send(self, prompt: str, keys: str, timeout: float = 30.0, start_pos: Optional[Tuple[int, int]] = None):
+        if start_pos is None:
+            start_pos = self.line_buffer.get_pos()
+        
         start_time = time.time()
         while time.time() - start_time < timeout:
-            if self.line_buffer.contains(prompt):
+            data = self.line_buffer.get_data_after(*start_pos)
+            if prompt in data:
                 if keys:
-                    self.ser.write(keys.encode('utf-8'))
-                    print(f"Sent interrupt keys: {repr(keys)}")
-                    time.sleep(0.5)  # Give device time to process and print prompt
-                return
+                    with self.ser_lock:
+                        self.ser.write(keys.encode('utf-8'))
+                    print(f"Sent keys: {repr(keys)}")
+                    time.sleep(0.1)
+                return True
             time.sleep(0.05)
-        print(f"Timed out waiting for prompt: {prompt}")
+        print(f"Timed out waiting for prompt {repr(prompt)}")
+        return False
 
     def run_server(self, socket_path: Path):
         if socket_path.exists():
@@ -221,7 +258,6 @@ class SerialManager:
                 
                 if cmd == "reset":
                     self.perform_reset()
-                    time.sleep(2.0)  # Ensure device is fully ready after interrupt
                     send_tlv(conn, TYPE_RESP_OK, "Reset complete")
                 elif cmd == "lines":
                     send_tlv(conn, TYPE_RESP_OK, self.line_buffer.get_range())
@@ -235,10 +271,19 @@ class SerialManager:
                     text = args.get("text")
                     prompt = args.get("prompt")
                     timeout = args.get("timeout", 30.0)
-                    self.ser.write(text.encode('utf-8'))
+                    
+                    start_pos = self.line_buffer.get_pos()
+                    with self.ser_lock:
+                        self.ser.write(text.encode('utf-8'))
+                    
                     if prompt:
-                        self.wait_and_send(prompt, "", timeout)
-                    send_tlv(conn, TYPE_RESP_OK, "Sent")
+                        success = self.wait_and_send(prompt, "", timeout, start_pos=start_pos)
+                        if success:
+                            send_tlv(conn, TYPE_RESP_OK, "Sent and prompt found")
+                        else:
+                            send_tlv(conn, TYPE_RESP_ERR, f"Timed out waiting for prompt: {prompt}")
+                    else:
+                        send_tlv(conn, TYPE_RESP_OK, "Sent")
                 else:
                     send_tlv(conn, TYPE_RESP_ERR, f"Unknown command: {cmd}")
             except Exception as e:
@@ -246,6 +291,7 @@ class SerialManager:
                     send_tlv(conn, TYPE_RESP_ERR, str(e))
                 except:
                     pass
+
 
 # --- CLI Commands ---
 
