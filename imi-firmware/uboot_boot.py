@@ -14,7 +14,7 @@ import shutil
 
 # Constants
 BAUD_UPLOAD = 115200
-TFTP_LOAD_ADDR = '0x81000000'
+TFTP_LOAD_ADDR = '0x84f00000'
 
 # YModem Constants
 SOH = b'\x01'
@@ -225,24 +225,29 @@ def disable_mcu_watchdog(ser):
     
     def update_dir():
         exec_cmd(ser, f'mw.l {GPIO_DIR:#x} {state["dir"]:#x} 1')
+        time.sleep(0.01)
 
     def update_dat():
         exec_cmd(ser, f'mw.l {GPIO_DAT:#x} {state["dat"]:#x} 1')
+        time.sleep(0.01)
 
     def i2c_set_scl(val):
         if val: state['dat'] |= (1 << 3)
         else: state['dat'] &= ~(1 << 3)
         update_dat()
+        time.sleep(0.01)
 
     def i2c_set_sda(val):
         if val: state['dat'] |= (1 << 4)
         else: state['dat'] &= ~(1 << 4)
         update_dat()
+        time.sleep(0.01)
 
     def i2c_set_sda_dir(is_output):
         if is_output: state['dir'] |= (1 << 4)
         else: state['dir'] &= ~(1 << 4)
         update_dir()
+        time.sleep(0.01)
 
     # Initial state: SCL, SDA high and output
     state['dir'] |= (1 << 3) | (1 << 4)
@@ -373,11 +378,11 @@ def boot_via_tftp(ser, image_path, tftp_server, tftp_image, usb_eth_mac):
 
 
 def boot_via_ymodem(ser, image_path):
-    print("[-] Sending 'loady 0x81000000' command...")
-    ser.write(b'loady 0x81000000\n')
+    print("[-] Sending 'loady 0x84f00000' command...")
+    ser.write(b'loady 0x84f00000\n')
     if send_ymodem(ser, image_path):
         print("\n[+] Image successfully loaded.")
-        print("bootm 0x81000000")
+        print("bootm 0x84f00000")
         return True
     return False
 
