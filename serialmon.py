@@ -16,6 +16,7 @@ import struct
 import threading
 import json
 import re
+import inspect
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
 import serial
@@ -421,6 +422,16 @@ def send(
 ):
     """Send a string to the serial port and optionally wait for a prompt."""
     print(client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port))
+
+def sendline(**kwargs):
+    """Send a string with a carriage return (\\r) to the serial port and optionally wait for a prompt."""
+    if "text" in kwargs:
+        kwargs["text"] += "\r"
+    return send(**kwargs)
+
+# Copy the signature from send to sendline to inherit all its flags and options
+sendline.__signature__ = inspect.signature(send)
+app.command(name="sendline")(sendline)
 
 if __name__ == "__main__":
     app()
