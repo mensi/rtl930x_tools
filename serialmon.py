@@ -25,7 +25,10 @@ import typer
 import platformdirs
 import paho.mqtt.publish as publish
 
-app = typer.Typer(help="Serial port monitor and manager")
+app = typer.Typer(
+    help="Serial port monitor and manager. Architecture: One 'manage' process runs per port, providing a buffer and optional boot interruption. Clients (reset, read, send, etc.) connect to the manager via Unix sockets.",
+    rich_markup_mode="markdown"
+)
 
 # --- Constants and Configuration ---
 DEFAULT_BAUD = 115200
@@ -341,17 +344,25 @@ class SerialManager:
 
 @app.command()
 def manage(
-    port: str = typer.Argument(..., help="Serial port to manage (e.g. /dev/ttyUSB0)"),
-    baud: int = typer.Option(DEFAULT_BAUD, help="Baud rate"),
-    buffer_size: int = typer.Option(DEFAULT_BUFFER_SIZE, help="Number of lines to keep in buffer"),
-    mqtt_host: Optional[str] = typer.Option(None, help="MQTT host for smart socket reset"),
-    mqtt_topic: Optional[str] = typer.Option(None, help="MQTT topic for smart socket reset"),
-    mqtt_on: str = typer.Option("ON", help="MQTT payload for ON"),
-    mqtt_off: str = typer.Option("OFF", help="MQTT payload for OFF"),
-    interrupt_boot: str = typer.Option("none", help="Boot interrupt method (uboot, imi, none)"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show serial traffic"),
+    port: str = typer.Argument(..., help="Serial port to manage (e.g., /dev/ttyUSB0)."),
+    baud: int = typer.Option(DEFAULT_BAUD, help="Baud rate for the serial connection."),
+    buffer_size: int = typer.Option(DEFAULT_BUFFER_SIZE, help="Maximum number of lines to keep in the history buffer."),
+    mqtt_host: Optional[str] = typer.Option(None, help="MQTT broker host for smart socket reset (e.g., 'localhost')."),
+    mqtt_topic: Optional[str] = typer.Option(None, help="MQTT topic to publish reset commands to."),
+    mqtt_on: str = typer.Option("ON", help="Payload sent to MQTT topic to turn power ON."),
+    mqtt_off: str = typer.Option("OFF", help="Payload sent to MQTT topic to turn power OFF."),
+    interrupt_boot: str = typer.Option(
+        "none", 
+        help="Mechanism to interrupt boot. 'uboot' waits for 'Hit Esc...' and sends ESC. 'imi' waits for 'No ethernet...' and countdown to send Ctrl-C,z,h."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Stream all raw serial traffic to stdout (useful for debugging boot)."),
 ):
-    """Start manager mode for a serial port. This runs in the foreground."""
+    """
+    Start the manager for a serial port. 
+
+    The manager remains in the foreground, buffering all data and listening for client connections. 
+    It also handles the boot interruption logic when a 'reset' command is received.
+    """
     mgr = SerialManager(port, baud, buffer_size, verbose=verbose)
     if mqtt_host and mqtt_topic:
         mgr.reset_method = "mqtt"
@@ -377,7 +388,7 @@ def manage(
 
 @app.command()
 def sessions():
-    """List active serialmon sessions."""
+    """List all currently active serialmon manager sessions by their port names."""
     sessions = list(get_session_dir().glob("*.sock"))
     if not sessions:
         print("No active sessions found.")
@@ -425,50 +436,59 @@ def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = 
         sys.exit(1)
 
 @app.command()
-def reset(port: Optional[str] = typer.Option(None, help="Serial port session to use")):
-    """Trigger a reset sequence on the device."""
+def reset(port: Optional[str] = typer.Option(None, help="Specific port session to use. Optional if only one session is active.")):
+    """
+    Trigger a device reset. 
+    
+    If an interrupt method is configured in the manager, this command will wait until 
+    the boot process is successfully interrupted before returning.
+    """
     print(client_request("reset", port=port))
 
 @app.command()
-def lines(port: Optional[str] = typer.Option(None, help="Serial port session to use")):
-    """Get the first and last line numbers currently held in the buffer."""
+def lines(port: Optional[str] = typer.Option(None, help="Specific port session to use.")):
+    """
+    Get the range of line numbers currently available in the buffer.
+    
+    Returns the oldest and newest line counters, and the content of the current (incomplete) line.
+    """
     start, end, current = client_request("lines", port=port)
     print(f"Lines in buffer: {start} to {end}")
     print(f"Current line: {repr(current)}")
 
 @app.command()
 def read(
-    start: int = typer.Argument(..., help="Starting line number"),
-    end: Optional[int] = typer.Argument(None, help="Ending line number (optional)"),
-    port: Optional[str] = typer.Option(None, help="Serial port session to use")
+    start: int = typer.Argument(..., help="Starting line number (inclusive)."),
+    end: Optional[int] = typer.Argument(None, help="Ending line number (inclusive). If omitted, reads until the end of the buffer."),
+    port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
-    """Read a range of lines from the buffer."""
+    """Read a specific range of lines from the history buffer."""
     lines = client_request("read", {"start": start, "end": end}, port=port)
     for num, line in lines:
         print(f"{num:6}: {line}")
 
 @app.command()
 def regex(
-    pattern: str = typer.Argument(..., help="Regex pattern to filter lines"),
-    port: Optional[str] = typer.Option(None, help="Serial port session to use")
+    pattern: str = typer.Argument(..., help="Regex pattern to search for in buffered lines."),
+    port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
-    """Filter lines in the buffer against a regex and print matches."""
+    """Search the entire buffer for lines matching the given regex pattern."""
     lines = client_request("regex", {"pattern": pattern}, port=port)
     for num, line in lines:
         print(f"{num:6}: {line}")
 
 @app.command()
 def send(
-    text: str = typer.Argument(..., help="Text to send to the serial port"),
-    prompt: Optional[str] = typer.Option(None, help="Wait for this prompt after sending"),
-    timeout: float = typer.Option(30.0, help="Timeout for waiting for prompt"),
-    port: Optional[str] = typer.Option(None, help="Serial port session to use")
+    text: str = typer.Argument(..., help="String to send to the device."),
+    prompt: Optional[str] = typer.Option(None, help="Optional: Wait for this string to appear in the output after sending."),
+    timeout: float = typer.Option(30.0, help="Timeout in seconds when waiting for a prompt."),
+    port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
-    """Send a string to the serial port and optionally wait for a prompt."""
+    """Send raw text to the serial port."""
     print(client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port))
 
 def sendline(**kwargs):
-    """Send a string with a carriage return (\\r) to the serial port and optionally wait for a prompt."""
+    """Send text followed by a carriage return (\\r)."""
     if "text" in kwargs:
         kwargs["text"] += "\r"
     return send(**kwargs)
