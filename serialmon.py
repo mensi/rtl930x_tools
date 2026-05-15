@@ -17,6 +17,7 @@ import threading
 import json
 import re
 import inspect
+import codecs
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
 import serial
@@ -150,9 +151,10 @@ class LineBuffer:
             return [(num, line) for num, line in self.buffer if prog.search(line)]
 
 class SerialManager:
-    def __init__(self, port: str, baud: int, buffer_size: int):
+    def __init__(self, port: str, baud: int, buffer_size: int, verbose: bool = False):
         self.port = port
         self.baud = baud
+        self.verbose = verbose
         self.line_buffer = LineBuffer(buffer_size)
         try:
             self.ser = serial.Serial(port, baud, timeout=0.1)
@@ -166,19 +168,25 @@ class SerialManager:
         self.stop_event = threading.Event()
 
     def serial_reader(self):
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         while not self.stop_event.is_set():
             try:
-                data = self.ser.read(1)
+                # Read all available bytes
+                data = self.ser.read(self.ser.in_waiting or 1)
                 if data:
-                    char = data.decode('utf-8', errors='replace')
-                    self.line_buffer.append_char(char)
+                    chars = decoder.decode(data)
+                    if self.verbose:
+                        sys.stdout.write(chars)
+                        sys.stdout.flush()
+                    for char in chars:
+                        self.line_buffer.append_char(char)
             except Exception as e:
                 if not self.stop_event.is_set():
                     print(f"Serial error: {e}")
                 break
         self.ser.close()
 
-    def perform_reset(self):
+    def perform_reset(self) -> bool:
         if self.reset_method == "mqtt":
             host = self.reset_params.get("host")
             topic = self.reset_params.get("topic")
@@ -192,26 +200,58 @@ class SerialManager:
                 publish.single(topic, on_val, hostname=host)
             except Exception as e:
                 print(f"MQTT error: {e}")
+                return False
         
         if self.interrupt_method != "none":
-            self.handle_interrupt()
+            return self.handle_interrupt()
+        return True
 
-    def handle_interrupt(self):
+    def handle_interrupt(self) -> bool:
         if self.interrupt_method == "uboot":
             print("Waiting for U-Boot interrupt prompt...")
             pos = self.line_buffer.get_pos()
             # Send single Esc first to be less aggressive
             if self.wait_and_send("Hit Esc key to stop autoboot", "\x1b", start_pos=pos):
                 pos2 = self.line_buffer.get_pos()
-                self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
+                return self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
+            return False
         elif self.interrupt_method == "imi":
-            print("Waiting for IMI interrupt prompt...")
+            print("Waiting for IMI interrupt marker ('No ethernet found.')...")
             pos = self.line_buffer.get_pos()
-            if self.wait_and_send("No ethernet found.", "\x03zh", start_pos=pos):
-                pos2 = self.line_buffer.get_pos()
-                self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
+            if self.wait_and_send("No ethernet found.", None, start_pos=pos, timeout=30.0):
+                print("Marker seen. Waiting for countdown...")
+                # The countdown looks like: "No ethernet found.\r\n\x08\x08\x08 3 \r\n\x08\x08\x08 2 \r\n\x08\x08\x08 1 \r\n\x08\x08\x08 0 \r\n"
+                # Actually, based on log: "\x08\x08\x08 0 "
+                # We should look for " 3 ", " 2 ", " 1 " or " 0 "
+                # Let's wait for any part of the countdown and then send the sequence
+                start_countdown = time.time()
+                while time.time() - start_countdown < 5:
+                    data = self.line_buffer.get_data_after(*pos)
+                    # We look for the countdown characters. They are often preceded by backspaces.
+                    if any(c in data for c in [" 3 ", " 2 ", " 1 ", " 0 "]):
+                        print("Countdown detected. Sending interrupt sequence (Ctrl+C, z, h)...")
+                        with self.ser_lock:
+                            self.ser.write(b'\x03zh')
+                        
+                        # Wait for the prompt
+                        pos2 = self.line_buffer.get_pos()
+                        if self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2):
+                            print("Successfully entered U-Boot prompt!")
+                            return True
+                        else:
+                            # Try one more Enter just in case
+                            with self.ser_lock:
+                                self.ser.write(b'\r')
+                            if self.wait_and_send("RTL9300# ", None, timeout=2.0, start_pos=pos2):
+                                print("Successfully entered U-Boot prompt!")
+                                return True
+                    time.sleep(0.01)
+                print("Timed out waiting for countdown.")
+                return False
+            return False
+        return True
 
-    def wait_and_send(self, prompt: str, keys: str, timeout: float = 30.0, start_pos: Optional[Tuple[int, int]] = None):
+    def wait_and_send(self, prompt: str, keys: Optional[str], timeout: float = 30.0, start_pos: Optional[Tuple[int, int]] = None):
         if start_pos is None:
             start_pos = self.line_buffer.get_pos()
         
@@ -258,8 +298,11 @@ class SerialManager:
                 args = req.get("args", {})
                 
                 if cmd == "reset":
-                    self.perform_reset()
-                    send_tlv(conn, TYPE_RESP_OK, "Reset complete")
+                    success = self.perform_reset()
+                    if success:
+                        send_tlv(conn, TYPE_RESP_OK, "Reset complete")
+                    else:
+                        send_tlv(conn, TYPE_RESP_ERR, "Reset/Interrupt failed")
                 elif cmd == "lines":
                     send_tlv(conn, TYPE_RESP_OK, self.line_buffer.get_range())
                 elif cmd == "read":
@@ -306,9 +349,10 @@ def manage(
     mqtt_on: str = typer.Option("ON", help="MQTT payload for ON"),
     mqtt_off: str = typer.Option("OFF", help="MQTT payload for OFF"),
     interrupt_boot: str = typer.Option("none", help="Boot interrupt method (uboot, imi, none)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show serial traffic"),
 ):
     """Start manager mode for a serial port. This runs in the foreground."""
-    mgr = SerialManager(port, baud, buffer_size)
+    mgr = SerialManager(port, baud, buffer_size, verbose=verbose)
     if mqtt_host and mqtt_topic:
         mgr.reset_method = "mqtt"
         mgr.reset_params = {"host": mqtt_host, "topic": mqtt_topic, "on": mqtt_on, "off": mqtt_off}
