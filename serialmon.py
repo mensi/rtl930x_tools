@@ -18,6 +18,7 @@ import json
 import re
 import inspect
 import codecs
+from collections import deque
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
 import serial
@@ -40,6 +41,7 @@ SOCKET_TIMEOUT = 60.0
 TYPE_REQ = 1
 TYPE_RESP_OK = 2
 TYPE_RESP_ERR = 3
+TYPE_PROGRESS = 4
 
 def send_tlv(sock: socket.socket, t: int, value: Any):
     data = json.dumps(value).encode('utf-8')
@@ -157,11 +159,24 @@ class SerialManager:
     GPIO_DIR = 0xb8003308
     GPIO_DAT = 0xb800330c
 
+    # YModem Constants
+    SOH = b'\x01'
+    STX = b'\x02'
+    EOT = b'\x04'
+    ACK = b'\x06'
+    NAK = b'\x15'
+    CAN = b'\x18'
+    CRC = b'C'
+
     def __init__(self, port: str, baud: int, buffer_size: int, verbose: bool = False):
         self.port = port
-        self.baud = baud
+        self.initial_baud = baud
+        self.current_baud = baud
         self.verbose = verbose
         self.line_buffer = LineBuffer(buffer_size)
+        self.raw_queue = deque() # For YModem raw byte access
+        self.raw_mode = False # When True, skip LineBuffer processing
+        self.serial_alive = True
         try:
             self.ser = serial.Serial(port, baud, timeout=0.1)
         except serial.SerialException as e:
@@ -180,19 +195,63 @@ class SerialManager:
                 # Read all available bytes
                 data = self.ser.read(self.ser.in_waiting or 1)
                 if data:
-                    chars = decoder.decode(data)
-                    if self.verbose:
-                        sys.stdout.write(chars)
-                        sys.stdout.flush()
-                    for char in chars:
-                        self.line_buffer.append_char(char)
+                    with self.ser_lock:
+                        self.raw_queue.append(data)
+                    
+                    if not self.raw_mode:
+                        chars = decoder.decode(data)
+                        if self.verbose:
+                            sys.stdout.write(chars)
+                            sys.stdout.flush()
+                        for char in chars:
+                            self.line_buffer.append_char(char)
+            except (serial.SerialException, OSError) as e:
+                if not self.stop_event.is_set():
+                    print(f"Serial port error: {e}")
+                    self.serial_alive = False
+                break
             except Exception as e:
                 if not self.stop_event.is_set():
-                    print(f"Serial error: {e}")
+                    print(f"Unexpected reader error: {e}")
                 break
         self.ser.close()
 
+    def check_serial(self) -> Tuple[bool, str]:
+        if not self.serial_alive:
+            return False, f"Serial port {self.port} is disconnected or inaccessible"
+        if not self.ser.is_open:
+            return False, f"Serial port {self.port} is closed"
+        return True, ""
+
+    def read_bytes(self, count: int, timeout: float = 5.0) -> bytes:
+        """Helper for YModem to read raw bytes while reader thread is active."""
+        start = time.time()
+        collected = b""
+        while len(collected) < count and time.time() - start < timeout:
+            with self.ser_lock:
+                if self.raw_queue:
+                    chunk = self.raw_queue.popleft()
+                    collected += chunk
+                else:
+                    time.sleep(0.01)
+                    continue
+            
+            if len(collected) > count:
+                # Put back extra bytes
+                extra = collected[count:]
+                collected = collected[:count]
+                with self.ser_lock:
+                    self.raw_queue.appendleft(extra)
+        return collected
+
     def perform_reset(self) -> bool:
+        # Revert to initial baud rate on reset
+        if self.current_baud != self.initial_baud:
+            print(f"Reverting baud rate to {self.initial_baud} for reset...")
+            with self.ser_lock:
+                self.ser.baudrate = self.initial_baud
+            self.current_baud = self.initial_baud
+
         if self.reset_method == "mqtt":
             host = self.reset_params.get("host")
             topic = self.reset_params.get("topic")
@@ -279,6 +338,148 @@ class SerialManager:
         if self.wait_and_send("RTL9300# ", None, timeout=timeout, start_pos=start_pos):
             return self.line_buffer.get_data_after(*start_pos)
         return ""
+
+    def switch_baud(self, new_baud: int) -> bool:
+        print(f"Requesting device baud rate change to {new_baud}...")
+        self.exec_u_boot_cmd(f"setenv baudrate {new_baud}")
+        
+        time.sleep(0.2)
+        
+        print(f"Switching manager baud rate to {new_baud}...")
+        with self.ser_lock:
+            self.ser.baudrate = new_baud
+        self.current_baud = new_baud
+        
+        time.sleep(0.5)
+        with self.ser_lock:
+            self.ser.write(b"\r\n\n")
+        
+        pos = self.line_buffer.get_pos()
+        if self.wait_and_send("RTL9300# ", None, timeout=5.0, start_pos=pos):
+            print(f"Successfully switched to {new_baud} baud.")
+            return True
+        else:
+            print(f"Failed to get prompt at {new_baud} baud.")
+            return False
+
+    def crc16(self, data: bytes) -> int:
+        crc = 0
+        for b in data:
+            crc ^= (b << 8)
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = (crc << 1) ^ 0x1021
+                else:
+                    crc = (crc << 1)
+                crc &= 0xFFFF
+        return crc
+
+    def upload_ymodem(self, filepath: str, addr: str, conn: Optional[socket.socket] = None) -> bool:
+        if not os.path.exists(filepath):
+            print(f"File not found: {filepath}")
+            return False
+
+        filesize = os.path.getsize(filepath)
+        filename = os.path.basename(filepath)
+
+        # Start the loady command
+        with self.ser_lock:
+            self.raw_queue.clear()
+            self.ser.write(f"loady {addr}\n".encode('ascii'))
+
+        self.raw_mode = True # Skip LineBuffer
+        try:
+            def wait_b(targets, timeout=30.0):
+                start = time.time()
+                while time.time() - start < timeout:
+                    b = self.read_bytes(1, timeout=0.1)
+                    if b in targets: return b
+                return b''
+
+            b = wait_b([self.CRC], timeout=30)
+            if b != self.CRC:
+                print(f"Timeout waiting for initial 'C' (got {repr(b)})")
+                return False
+
+            # Header packet (Block 0)
+            header = filename.encode('ascii') + b'\x00' + str(filesize).encode('ascii') + b'\x00'
+            header = header.ljust(128, b'\x00')
+            packet = self.SOH + b'\x00\xff' + header + struct.pack('>H', self.crc16(header))
+            with self.ser_lock:
+                self.ser.write(packet)
+
+            if wait_b([self.ACK]) != self.ACK: 
+                return False
+            if wait_b([self.CRC]) != self.CRC: 
+                return False
+
+            with open(filepath, 'rb') as f:
+                block_num = 1
+                sent_bytes = 0
+                while True:
+                    chunk = f.read(1024)
+                    if not chunk: break
+
+                    sent_bytes += len(chunk)
+                    chunk = chunk.ljust(1024, b'\x1a')
+
+                    packet = self.STX + struct.pack('BB', block_num & 0xFF, (255 - (block_num & 0xFF))) + chunk + struct.pack('>H', self.crc16(chunk))
+
+                    # Retry loop for this block
+                    retries = 5
+                    while retries > 0:
+                        with self.ser_lock:
+                            self.ser.write(packet)
+
+                        b = wait_b([self.ACK, self.NAK, self.CRC], timeout=20)
+                        if b == self.ACK:
+                            break
+                        elif b in [self.NAK, self.CRC]:
+                            retries -= 1
+                        else:
+                            return False
+
+                    if retries == 0:
+                        return False
+
+                    block_num += 1
+                    if block_num % 50 == 0:
+                        percent = (sent_bytes/filesize)*100
+                        if conn:
+                            try:
+                                send_tlv(conn, TYPE_PROGRESS, {"percent": percent})
+                            except:
+                                pass # Client might have closed
+                        sys.stdout.write(f"\rProgress: {sent_bytes}/{filesize} bytes ({percent:.1f}%)")
+                        sys.stdout.flush()
+
+            print(f"\rProgress: {sent_bytes}/{filesize} bytes (100.0%)")
+
+            with self.ser_lock:
+                self.ser.write(self.EOT)
+
+            b = wait_b([self.NAK], timeout=5)
+            with self.ser_lock:
+                self.ser.write(self.EOT)
+
+            wait_b([self.ACK], timeout=5)
+            wait_b([self.CRC], timeout=5)
+
+            null_block = b'\x00' * 128
+            packet = self.SOH + b'\x00\xff' + null_block + struct.pack('>H', self.crc16(null_block))
+            with self.ser_lock:
+                self.ser.write(packet)
+
+            wait_b([self.ACK], timeout=5)
+
+            print("\nUpload complete!")
+            return True
+        except Exception as e:
+            print(f"YModem exception: {e}")
+            return False
+        finally:
+            self.raw_mode = False
+
 
     def read_reg(self, addr: int) -> int:
         output = self.exec_u_boot_cmd(f"md.l {addr:#x} 1")
@@ -427,6 +628,13 @@ class SerialManager:
                 cmd = req.get("cmd")
                 args = req.get("args", {})
                 
+                # Port check for commands that need serial
+                if cmd in ["reset", "disable-hasivo-mcu-watchdog", "switch-baud", "upload-ymodem", "send"]:
+                    alive, err = self.check_serial()
+                    if not alive:
+                        send_tlv(conn, TYPE_RESP_ERR, err)
+                        return
+
                 if cmd == "reset":
                     success = self.perform_reset()
                     if success:
@@ -439,6 +647,18 @@ class SerialManager:
                         send_tlv(conn, TYPE_RESP_OK, "Hasivo MCU watchdog disabled")
                     else:
                         send_tlv(conn, TYPE_RESP_ERR, "Failed to disable Hasivo MCU watchdog")
+                elif cmd == "switch-baud":
+                    success = self.switch_baud(args.get("baud"))
+                    if success:
+                        send_tlv(conn, TYPE_RESP_OK, "Baud rate switched")
+                    else:
+                        send_tlv(conn, TYPE_RESP_ERR, "Failed to switch baud rate")
+                elif cmd == "upload-ymodem":
+                    success = self.upload_ymodem(args.get("filepath"), args.get("addr"), conn)
+                    if success:
+                        send_tlv(conn, TYPE_RESP_OK, "Upload complete")
+                    else:
+                        send_tlv(conn, TYPE_RESP_ERR, "Upload failed")
                 elif cmd == "lines":
                     send_tlv(conn, TYPE_RESP_OK, self.line_buffer.get_range())
                 elif cmd == "read":
@@ -480,22 +700,14 @@ def manage(
     port: str = typer.Argument(..., help="Serial port to manage (e.g., /dev/ttyUSB0)."),
     baud: int = typer.Option(DEFAULT_BAUD, help="Baud rate for the serial connection."),
     buffer_size: int = typer.Option(DEFAULT_BUFFER_SIZE, help="Maximum number of lines to keep in the history buffer."),
-    mqtt_host: Optional[str] = typer.Option(None, help="MQTT broker host for smart socket reset (e.g., 'localhost')."),
-    mqtt_topic: Optional[str] = typer.Option(None, help="MQTT topic to publish reset commands to."),
-    mqtt_on: str = typer.Option("ON", help="Payload sent to MQTT topic to turn power ON."),
-    mqtt_off: str = typer.Option("OFF", help="Payload sent to MQTT topic to turn power OFF."),
-    interrupt_boot: str = typer.Option(
-        "none", 
-        help="Mechanism to interrupt boot. 'uboot' waits for 'Hit Esc...' and sends ESC. 'imi' waits for 'No ethernet...' and countdown to send Ctrl-C,z,h."
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Stream all raw serial traffic to stdout (useful for debugging boot)."),
+    mqtt_host: Optional[str] = typer.Option(None, help="MQTT host for smart socket reset"),
+    mqtt_topic: Optional[str] = typer.Option(None, help="MQTT topic for smart socket reset"),
+    mqtt_on: str = typer.Option("ON", help="MQTT payload for ON"),
+    mqtt_off: str = typer.Option("OFF", help="MQTT payload for OFF"),
+    interrupt_boot: str = typer.Option("none", help="Boot interrupt method (uboot, imi, none)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show serial traffic"),
 ):
-    """
-    Start the manager for a serial port. 
-
-    The manager remains in the foreground, buffering all data and listening for client connections. 
-    It also handles the boot interruption logic when a 'reset' command is received.
-    """
+    """Start manager mode for a serial port. This runs in the foreground."""
     mgr = SerialManager(port, baud, buffer_size, verbose=verbose)
     if mqtt_host and mqtt_topic:
         mgr.reset_method = "mqtt"
@@ -530,7 +742,7 @@ def sessions():
         for s in sessions:
             print(f"  {s.stem.replace('_', '/')}")
 
-def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None) -> Tuple[bool, Any]:
+def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None, timeout: float = SOCKET_TIMEOUT) -> Tuple[bool, Any]:
     sessions = list(get_session_dir().glob("*.sock"))
     if not sessions:
         print("No active sessions found. Run 'manage' first.")
@@ -552,16 +764,32 @@ def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = 
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(SOCKET_TIMEOUT)
+            client.settimeout(timeout)
             client.connect(str(socket_path))
             send_tlv(client, TYPE_REQ, {"cmd": cmd, "args": args or {}})
-            t, resp = recv_tlv(client)
-            if t == TYPE_RESP_OK:
-                return True, resp
-            else:
-                return False, resp
+            
+            last_progress = False
+            while True:
+                t, resp = recv_tlv(client)
+                if t == TYPE_PROGRESS:
+                    percent = resp.get("percent", 0)
+                    sys.stdout.write(f"\rProgress: {percent:.1f}%")
+                    sys.stdout.flush()
+                    last_progress = True
+                    continue
+                
+                if last_progress:
+                    print() # Newline after progress bar
+                
+                if t == TYPE_RESP_OK:
+                    return True, resp
+                else:
+                    return False, resp
     except ConnectionRefusedError:
         print(f"Connection refused to {socket_path}. Is the manager running?")
+        sys.exit(1)
+    except socket.timeout:
+        print(f"Error connecting to manager: timed out after {timeout}s")
         sys.exit(1)
     except Exception as e:
         print(f"Error connecting to manager: {e}")
@@ -589,6 +817,33 @@ def disable_hasivo_mcu_watchdog(port: Optional[str] = typer.Option(None, help="S
     to the MCU and disable the hardware watchdog. The device must be at a U-Boot prompt.
     """
     ok, resp = client_request("disable-hasivo-mcu-watchdog", port=port)
+    print(resp)
+    if not ok:
+        sys.exit(1)
+
+@app.command()
+def switch_baud(
+    baud: int = typer.Argument(..., help="New baud rate to switch to."),
+    port: Optional[str] = typer.Option(None, help="Specific port session to use.")
+):
+    """
+    Switch the serial baud rate on both the device and the manager.
+    
+    The manager will automatically revert to the initial baud rate upon a device reset.
+    """
+    ok, resp = client_request("switch-baud", {"baud": baud}, port=port)
+    print(resp)
+    if not ok:
+        sys.exit(1)
+
+@app.command()
+def upload_ymodem(
+    filepath: str = typer.Argument(..., help="Path to the file to upload."),
+    addr: str = typer.Argument(..., help="U-Boot memory address to upload to (e.g., 0x81000000)."),
+    port: Optional[str] = typer.Option(None, help="Specific port session to use.")
+):
+    """Upload a file to the device memory using the YModem protocol."""
+    ok, resp = client_request("upload-ymodem", {"filepath": filepath, "addr": addr}, port=port)
     print(resp)
     if not ok:
         sys.exit(1)
