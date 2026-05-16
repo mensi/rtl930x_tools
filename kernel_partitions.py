@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """
 MTD Partition Table Extractor for Realtek RTL930x.
 Identifies partition layouts embedded in vmlinux binaries and applies them to firmware dumps.
