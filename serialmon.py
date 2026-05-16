@@ -530,7 +530,7 @@ def sessions():
         for s in sessions:
             print(f"  {s.stem.replace('_', '/')}")
 
-def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None):
+def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None) -> Tuple[bool, Any]:
     sessions = list(get_session_dir().glob("*.sock"))
     if not sessions:
         print("No active sessions found. Run 'manage' first.")
@@ -557,10 +557,9 @@ def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = 
             send_tlv(client, TYPE_REQ, {"cmd": cmd, "args": args or {}})
             t, resp = recv_tlv(client)
             if t == TYPE_RESP_OK:
-                return resp
+                return True, resp
             else:
-                print(f"Error from manager: {resp}")
-                sys.exit(1)
+                return False, resp
     except ConnectionRefusedError:
         print(f"Connection refused to {socket_path}. Is the manager running?")
         sys.exit(1)
@@ -576,7 +575,10 @@ def reset(port: Optional[str] = typer.Option(None, help="Specific port session t
     If an interrupt method is configured in the manager, this command will wait until 
     the boot process is successfully interrupted before returning.
     """
-    print(client_request("reset", port=port))
+    ok, resp = client_request("reset", port=port)
+    print(resp)
+    if not ok:
+        sys.exit(1)
 
 @app.command()
 def disable_hasivo_mcu_watchdog(port: Optional[str] = typer.Option(None, help="Specific port session to use.")):
@@ -586,7 +588,10 @@ def disable_hasivo_mcu_watchdog(port: Optional[str] = typer.Option(None, help="S
     This command performs manual I2C bit-banging via U-Boot GPIO commands to talk 
     to the MCU and disable the hardware watchdog. The device must be at a U-Boot prompt.
     """
-    print(client_request("disable-hasivo-mcu-watchdog", port=port))
+    ok, resp = client_request("disable-hasivo-mcu-watchdog", port=port)
+    print(resp)
+    if not ok:
+        sys.exit(1)
 
 @app.command()
 def lines(port: Optional[str] = typer.Option(None, help="Specific port session to use.")):
@@ -595,7 +600,11 @@ def lines(port: Optional[str] = typer.Option(None, help="Specific port session t
     
     Returns the oldest and newest line counters, and the content of the current (incomplete) line.
     """
-    start, end, current = client_request("lines", port=port)
+    ok, resp = client_request("lines", port=port)
+    if not ok:
+        print(f"Error: {resp}")
+        sys.exit(1)
+    start, end, current = resp
     print(f"Lines in buffer: {start} to {end}")
     print(f"Current line (partial): {repr(current)}")
 
@@ -606,8 +615,11 @@ def read(
     port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
     """Read a specific range of lines from the history buffer."""
-    lines = client_request("read", {"start": start, "end": end}, port=port)
-    for num, line in lines:
+    ok, resp = client_request("read", {"start": start, "end": end}, port=port)
+    if not ok:
+        print(f"Error: {resp}")
+        sys.exit(1)
+    for num, line in resp:
         print(f"{num:6}: {line}")
 
 @app.command()
@@ -616,8 +628,11 @@ def regex(
     port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
     """Search the entire buffer for lines matching the given regex pattern."""
-    lines = client_request("regex", {"pattern": pattern}, port=port)
-    for num, line in lines:
+    ok, resp = client_request("regex", {"pattern": pattern}, port=port)
+    if not ok:
+        print(f"Error: {resp}")
+        sys.exit(1)
+    for num, line in resp:
         print(f"{num:6}: {line}")
 
 @app.command()
@@ -628,7 +643,10 @@ def send(
     port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
     """Send raw text to the serial port."""
-    print(client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port))
+    ok, resp = client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port)
+    print(resp)
+    if not ok:
+        sys.exit(1)
 
 def sendline(**kwargs):
     """Send text followed by a carriage return (\\r)."""
