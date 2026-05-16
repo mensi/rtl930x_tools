@@ -154,6 +154,9 @@ class LineBuffer:
             return [(num, line) for num, line in self.buffer if prog.search(line)]
 
 class SerialManager:
+    GPIO_DIR = 0xb8003308
+    GPIO_DAT = 0xb800330c
+
     def __init__(self, port: str, baud: int, buffer_size: int, verbose: bool = False):
         self.port = port
         self.baud = baud
@@ -223,14 +226,9 @@ class SerialManager:
             pos = self.line_buffer.get_pos()
             if self.wait_and_send("No ethernet found.", None, start_pos=pos, timeout=30.0):
                 print("Marker seen. Waiting for countdown...")
-                # The countdown looks like: "No ethernet found.\r\n\x08\x08\x08 3 \r\n\x08\x08\x08 2 \r\n\x08\x08\x08 1 \r\n\x08\x08\x08 0 \r\n"
-                # Actually, based on log: "\x08\x08\x08 0 "
-                # We should look for " 3 ", " 2 ", " 1 " or " 0 "
-                # Let's wait for any part of the countdown and then send the sequence
                 start_countdown = time.time()
                 while time.time() - start_countdown < 5:
                     data = self.line_buffer.get_data_after(*pos)
-                    # We look for the countdown characters. They are often preceded by backspaces.
                     if any(c in data for c in [" 3 ", " 2 ", " 1 ", " 0 "]):
                         print("Countdown detected. Sending interrupt sequence (Ctrl+C, z, h)...")
                         with self.ser_lock:
@@ -272,6 +270,135 @@ class SerialManager:
         print(f"Timed out waiting for prompt {repr(prompt)}")
         return False
 
+    def exec_u_boot_cmd(self, cmd: str, timeout: float = 2.0) -> str:
+        start_pos = self.line_buffer.get_pos()
+        with self.ser_lock:
+            self.ser.write(f"{cmd}\n".encode('ascii'))
+        
+        # Wait for prompt
+        if self.wait_and_send("RTL9300# ", None, timeout=timeout, start_pos=start_pos):
+            return self.line_buffer.get_data_after(*start_pos)
+        return ""
+
+    def read_reg(self, addr: int) -> int:
+        output = self.exec_u_boot_cmd(f"md.l {addr:#x} 1")
+        prefix = f"{addr & 0xffffffff:08x}: "
+        for line in output.splitlines():
+            if prefix in line:
+                parts = line.split(prefix)[1].strip().split()
+                if parts:
+                    try:
+                        return int(parts[0], 16)
+                    except ValueError:
+                        pass
+        return 0
+
+    def disable_hasivo_mcu_watchdog(self) -> bool:
+        print("Attempting to disable Hasivo MCU watchdog via I2C bit-banging...")
+        
+        # Get current state
+        initial_dir = self.read_reg(self.GPIO_DIR)
+        initial_dat = self.read_reg(self.GPIO_DAT)
+        if initial_dir == 0 and initial_dat == 0:
+            print("Failed to read GPIO registers. Are you at a U-Boot prompt?")
+            return False
+            
+        print(f"Initial GPIO DIR: {initial_dir:#010x}, DAT: {initial_dat:#010x}")
+        
+        state = {'dir': initial_dir, 'dat': initial_dat}
+        
+        def update_dir():
+            self.exec_u_boot_cmd(f"mw.l {self.GPIO_DIR:#x} {state['dir']:#x} 1")
+
+        def update_dat():
+            self.exec_u_boot_cmd(f"mw.l {self.GPIO_DAT:#x} {state['dat']:#x} 1")
+
+        def i2c_set_scl(val):
+            if val: state['dat'] |= (1 << 3)
+            else: state['dat'] &= ~(1 << 3)
+            update_dat()
+
+        def i2c_set_sda(val):
+            if val: state['dat'] |= (1 << 4)
+            else: state['dat'] &= ~(1 << 4)
+            update_dat()
+
+        def i2c_set_sda_dir(is_output):
+            if is_output: state['dir'] |= (1 << 4)
+            else: state['dir'] &= ~(1 << 4)
+            update_dir()
+
+        # Initial state: SCL, SDA high and output
+        state['dir'] |= (1 << 3) | (1 << 4)
+        state['dat'] |= (1 << 3) | (1 << 4)
+        update_dir()
+        update_dat()
+
+        def i2c_start():
+            i2c_set_sda(1); i2c_set_scl(1); i2c_set_sda(0); i2c_set_scl(0)
+
+        def i2c_stop():
+            i2c_set_sda(0); i2c_set_scl(1); i2c_set_sda(1)
+
+        def i2c_write_byte(byte):
+            for i in range(8):
+                i2c_set_sda((byte >> (7 - i)) & 1)
+                i2c_set_scl(1); i2c_set_scl(0)
+            i2c_set_sda_dir(False)
+            i2c_set_scl(1); i2c_set_scl(0)
+            i2c_set_sda_dir(True)
+
+        def i2c_read_byte():
+            byte = 0
+            i2c_set_sda_dir(False)
+            for i in range(8):
+                i2c_set_scl(1)
+                val = self.read_reg(self.GPIO_DAT)
+                bit = (val >> 4) & 1
+                byte = (byte << 1) | bit
+                i2c_set_scl(0)
+            return byte
+
+        def i2c_send_ack(ack):
+            i2c_set_sda_dir(True)
+            i2c_set_sda(0 if ack else 1)
+            i2c_set_scl(1); i2c_set_scl(0); i2c_set_sda(1)
+
+        def i2c_read_reg(addr, reg):
+            i2c_start()
+            i2c_write_byte(addr)
+            i2c_write_byte(reg)
+            i2c_start()
+            i2c_write_byte(addr | 1)
+            val = i2c_read_byte()
+            i2c_send_ack(False)
+            i2c_stop()
+            return val
+
+        def i2c_write_reg(addr, reg, val):
+            i2c_start()
+            i2c_write_byte(addr)
+            i2c_write_byte(reg)
+            i2c_write_byte(val)
+            i2c_stop()
+
+        found_addr = None
+        print("Checking for MCU watchdog...")
+        if i2c_read_reg(0xde, 0xfd) == 0x91:
+            found_addr = 0xde
+        elif i2c_read_reg(0xdc, 0x66) == 0x91:
+            found_addr = 0xdc
+
+        if found_addr:
+            print(f"Found MCU watchdog at {found_addr:#x}. Disabling...")
+            i2c_write_reg(found_addr, 0x09, 0x4f)
+            i2c_write_reg(found_addr, 0x0a, 0x3f)
+            print("MCU watchdog disabled.")
+            return True
+        else:
+            print("MCU watchdog not found.")
+            return False
+
     def run_server(self, socket_path: Path):
         if socket_path.exists():
             socket_path.unlink()
@@ -306,6 +433,12 @@ class SerialManager:
                         send_tlv(conn, TYPE_RESP_OK, "Reset complete")
                     else:
                         send_tlv(conn, TYPE_RESP_ERR, "Reset/Interrupt failed")
+                elif cmd == "disable-hasivo-mcu-watchdog":
+                    success = self.disable_hasivo_mcu_watchdog()
+                    if success:
+                        send_tlv(conn, TYPE_RESP_OK, "Hasivo MCU watchdog disabled")
+                    else:
+                        send_tlv(conn, TYPE_RESP_ERR, "Failed to disable Hasivo MCU watchdog")
                 elif cmd == "lines":
                     send_tlv(conn, TYPE_RESP_OK, self.line_buffer.get_range())
                 elif cmd == "read":
@@ -446,6 +579,16 @@ def reset(port: Optional[str] = typer.Option(None, help="Specific port session t
     print(client_request("reset", port=port))
 
 @app.command()
+def disable_hasivo_mcu_watchdog(port: Optional[str] = typer.Option(None, help="Specific port session to use.")):
+    """
+    Disable the Hasivo MCU watchdog. 
+    
+    This command performs manual I2C bit-banging via U-Boot GPIO commands to talk 
+    to the MCU and disable the hardware watchdog. The device must be at a U-Boot prompt.
+    """
+    print(client_request("disable-hasivo-mcu-watchdog", port=port))
+
+@app.command()
 def lines(port: Optional[str] = typer.Option(None, help="Specific port session to use.")):
     """
     Get the range of line numbers currently available in the buffer.
@@ -454,7 +597,7 @@ def lines(port: Optional[str] = typer.Option(None, help="Specific port session t
     """
     start, end, current = client_request("lines", port=port)
     print(f"Lines in buffer: {start} to {end}")
-    print(f"Current line: {repr(current)}")
+    print(f"Current line (partial): {repr(current)}")
 
 @app.command()
 def read(
