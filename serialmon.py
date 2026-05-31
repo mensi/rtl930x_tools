@@ -278,8 +278,7 @@ class SerialManager:
             pos = self.line_buffer.get_pos()
             # Send single Esc first to be less aggressive
             if self.wait_and_send("Hit Esc key to stop autoboot", "\x1b", start_pos=pos):
-                pos2 = self.line_buffer.get_pos()
-                return self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos2)
+                return self.wait_and_send("RTL9300# ", "\r", timeout=5.0, start_pos=pos)
             return False
         elif self.interrupt_method == "imi":
             print("Waiting for IMI interrupt marker ('No ethernet found.')...")
