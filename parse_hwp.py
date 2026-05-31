@@ -595,7 +595,8 @@ def emit_swDescp(sd, var_name, unit_idx=0, multi_unit=False):
             f10 = f".led_f = {fmt_byte_or_none(p['led_f'])}"
             f11 = f".led_layout = {fmt_led_layout(p['led_layout'])}"
             f12 = f".phy_mdi_pin_swap = {p['phy_mdi_pin_swap']}"
-            line = "        { " + ", ".join([f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12]) + ", },"
+            f13 = f".phy_mdi_pair_swap = {p['phy_mdi_pair_swap']}"
+            line = "        { " + ", ".join([f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13]) + ", },"
             lines.append(line)
         lines.append("        { .mac_id = HWP_END },")
         lines.append("    },  /* port.descp */")
