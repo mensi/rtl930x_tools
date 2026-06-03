@@ -393,10 +393,17 @@ class SerialManager:
                 start = time.time()
                 while time.time() - start < timeout:
                     b = self.read_bytes(1, timeout=0.1)
-                    if b in targets: return b
+                    if b:
+                        if self.verbose:
+                            print(f"[YModem RX] Got byte: {repr(b)} (waiting for {targets})")
+                        if b in targets: 
+                            return b
                 return b''
 
-            b = wait_b([self.CRC], timeout=30)
+            b = wait_b([self.CRC, self.CAN], timeout=30)
+            if b == self.CAN:
+                print("Cancel received from receiver")
+                return False
             if b != self.CRC:
                 print(f"Timeout waiting for initial 'C' (got {repr(b)})")
                 return False
@@ -405,12 +412,35 @@ class SerialManager:
             header = filename.encode('ascii') + b'\x00' + str(filesize).encode('ascii') + b'\x00'
             header = header.ljust(128, b'\x00')
             packet = self.SOH + b'\x00\xff' + header + struct.pack('>H', self.crc16(header))
-            with self.ser_lock:
-                self.ser.write(packet)
+            
+            header_acked = False
+            retries = 5
+            while retries > 0:
+                with self.ser_lock:
+                    self.raw_queue.clear()
+                    self.ser.write(packet)
+                
+                b = wait_b([self.ACK, self.NAK, self.CAN, self.CRC], timeout=10)
+                if b == self.ACK:
+                    # After ACK, the receiver must send 'C' (self.CRC) to initiate data transfer.
+                    # Wait for it.
+                    b_crc = wait_b([self.CRC, self.CAN], timeout=10)
+                    if b_crc == self.CRC:
+                        header_acked = True
+                        break
+                    elif b_crc == self.CAN:
+                        print("Cancel received after header ACK")
+                        return False
+                elif b == self.CAN:
+                    print("Cancel received for header block")
+                    return False
+                
+                print(f"\nHeader block retry (got {repr(b)}), remaining retries: {retries-1}")
+                retries -= 1
+                time.sleep(1)
 
-            if wait_b([self.ACK]) != self.ACK: 
-                return False
-            if wait_b([self.CRC]) != self.CRC: 
+            if not header_acked:
+                print("Failed to handshake header block")
                 return False
 
             with open(filepath, 'rb') as f:
@@ -425,25 +455,43 @@ class SerialManager:
 
                     packet = self.STX + struct.pack('BB', block_num & 0xFF, (255 - (block_num & 0xFF))) + chunk + struct.pack('>H', self.crc16(chunk))
 
+                    # Determine valid targets for this block
+                    if block_num == 1:
+                        # For Block 1 (Firstsec), the receiver might send CRC 'C' to retry/restart.
+                        targets = [self.ACK, self.NAK, self.CRC, self.CAN]
+                    else:
+                        # For Block 2+, it should only send NAK, ACK, or CAN.
+                        targets = [self.ACK, self.NAK, self.CAN]
+
                     # Retry loop for this block
                     retries = 5
                     while retries > 0:
                         with self.ser_lock:
+                            self.raw_queue.clear()  # Clear any stale responses before sending
                             self.ser.write(packet)
 
-                        b = wait_b([self.ACK, self.NAK, self.CRC], timeout=20)
+                        b = wait_b(targets, timeout=20)
                         if b == self.ACK:
                             break
-                        elif b in [self.NAK, self.CRC]:
-                            retries -= 1
-                        else:
+                        elif b == self.CAN:
+                            print("\nUpload cancelled by receiver")
                             return False
+                        elif b in [self.NAK, self.CRC]:
+                            sys.stdout.write(f"\nGot {b!r} instead of ACK, block retries={retries}\n")
+                            sys.stdout.write(f"Progress: {sent_bytes}/{filesize} bytes; Retrying...")
+                            retries -= 1
+                            time.sleep(1)
+                        else:
+                            # Timeout / empty response
+                            sys.stdout.write(f"\nTimeout waiting for block response, block retries={retries}\n")
+                            retries -= 1
+                            time.sleep(1)
 
                     if retries == 0:
                         return False
 
                     block_num += 1
-                    if block_num % 50 == 0:
+                    if block_num % 50 == 0 or sent_bytes == filesize:
                         percent = (sent_bytes/filesize)*100
                         if conn:
                             try:
@@ -455,22 +503,49 @@ class SerialManager:
 
             print(f"\rProgress: {sent_bytes}/{filesize} bytes (100.0%)")
 
-            with self.ser_lock:
-                self.ser.write(self.EOT)
+            # EOT sequence (End of Transmission)
+            eot_confirmed = False
+            for attempt in range(5):
+                with self.ser_lock:
+                    self.raw_queue.clear()
+                    self.ser.write(self.EOT)
+                
+                b = wait_b([self.ACK, self.NAK, self.CAN], timeout=5)
+                if b == self.ACK:
+                    eot_confirmed = True
+                    break
+                elif b == self.CAN:
+                    print("\nEOT cancelled by receiver")
+                    return False
+                elif b == self.NAK:
+                    # Receiver wants another EOT
+                    with self.ser_lock:
+                        self.raw_queue.clear()
+                        self.ser.write(self.EOT)
+                    b2 = wait_b([self.ACK, self.CAN], timeout=5)
+                    if b2 == self.ACK:
+                        eot_confirmed = True
+                        break
+                    elif b2 == self.CAN:
+                        print("\nEOT cancelled by receiver")
+                        return False
+                time.sleep(0.5)
 
-            b = wait_b([self.NAK], timeout=5)
-            with self.ser_lock:
-                self.ser.write(self.EOT)
+            if not eot_confirmed:
+                print("\nWarning: EOT not acknowledged")
 
-            wait_b([self.ACK], timeout=5)
-            wait_b([self.CRC], timeout=5)
-
-            null_block = b'\x00' * 128
-            packet = self.SOH + b'\x00\xff' + null_block + struct.pack('>H', self.crc16(null_block))
-            with self.ser_lock:
-                self.ser.write(packet)
-
-            wait_b([self.ACK], timeout=5)
+            # Wait for 'C' to send the null block (end of session)
+            b = wait_b([self.CRC, self.CAN], timeout=5)
+            if b == self.CAN:
+                print("\nSession end cancelled by receiver")
+                return False
+            if b == self.CRC:
+                null_block = b'\x00' * 128
+                packet = self.SOH + b'\x00\xff' + null_block + struct.pack('>H', self.crc16(null_block))
+                with self.ser_lock:
+                    self.raw_queue.clear()
+                    self.ser.write(packet)
+                wait_b([self.ACK, self.CAN], timeout=5)
 
             print("\nUpload complete!")
             return True
