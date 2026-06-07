@@ -817,7 +817,7 @@ def sessions():
         for s in sessions:
             print(f"  {s.stem.replace('_', '/')}")
 
-def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None, timeout: float = SOCKET_TIMEOUT) -> Tuple[bool, Any]:
+def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = None, timeout: Optional[float] = SOCKET_TIMEOUT) -> Tuple[bool, Any]:
     sessions = list(get_session_dir().glob("*.sock"))
     if not sessions:
         print("No active sessions found. Run 'manage' first.")
@@ -864,7 +864,8 @@ def client_request(cmd: str, args: Dict[str, Any] = None, port: Optional[str] = 
         print(f"Connection refused to {socket_path}. Is the manager running?")
         sys.exit(1)
     except socket.timeout:
-        print(f"Error connecting to manager: timed out after {timeout}s")
+        timeout_str = f" after {timeout}s" if timeout is not None else ""
+        print(f"Error connecting to manager: timed out{timeout_str}")
         sys.exit(1)
     except Exception as e:
         print(f"Error connecting to manager: {e}")
@@ -878,7 +879,7 @@ def reset(port: Optional[str] = typer.Option(None, help="Specific port session t
     If an interrupt method is configured in the manager, this command will wait until 
     the boot process is successfully interrupted before returning.
     """
-    ok, resp = client_request("reset", port=port)
+    ok, resp = client_request("reset", port=port, timeout=None)
     print(resp)
     if not ok:
         sys.exit(1)
@@ -918,7 +919,7 @@ def upload_ymodem(
     port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
     """Upload a file to the device memory using the YModem protocol."""
-    ok, resp = client_request("upload-ymodem", {"filepath": filepath, "addr": addr}, port=port)
+    ok, resp = client_request("upload-ymodem", {"filepath": filepath, "addr": addr}, port=port, timeout=None)
     print(resp)
     if not ok:
         sys.exit(1)
@@ -973,7 +974,7 @@ def send(
     port: Optional[str] = typer.Option(None, help="Specific port session to use.")
 ):
     """Send raw text to the serial port."""
-    ok, resp = client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port)
+    ok, resp = client_request("send", {"text": text, "prompt": prompt, "timeout": timeout}, port=port, timeout=timeout + 10.0)
     print(resp)
     if not ok:
         sys.exit(1)
